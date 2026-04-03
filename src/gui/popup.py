@@ -1,0 +1,830 @@
+# src/gui/popup.py
+import base64
+import logging
+import threading
+import time
+from io import BytesIO
+from typing import Any, Dict, List, Optional, Tuple
+
+from PyQt6.QtCore import QTimer, QPoint, QSize, Qt, pyqtSignal
+from PyQt6.QtGui import QColor, QCursor, QFont, QFontMetrics, QFontInfo
+from PyQt6.QtWidgets import QWidget, QVBoxLayout, QLabel, QFrame, QApplication
+
+from src.config.config import config, IS_MACOS
+from src.dictionary.lookup import DictionaryEntry, KanjiEntry
+from src.dictionary.anki_client import AnkiClient
+from src.gui.magpie_manager import magpie_manager
+import re as _re  # hoisted — used in Anki duplicate/presence checks
+from src.utils.window_info import get_active_window_title
+
+if IS_MACOS:
+    try:
+        import Quartz
+    except ImportError:
+        Quartz = None
+
+logger = logging.getLogger(__name__)
+
+MINE_BAR_HEIGHT = 30  # fixed pixel height reserved for the mine status bar
+
+
+class Popup(QWidget):
+    # Signals are always delivered on the main thread (AutoConnection) — safe to emit from threads
+    anki_presence_updated  = pyqtSignal(str, bool)  # (word, is_present) — word prevents race condition
+    status_message_signal  = pyqtSignal(str)    # show a brief status message
+
+    def __init__(self, shared_state, input_loop):
+        super().__init__()
+        self._latest_data    = None
+        self._latest_context: Optional[Dict[str, Any]] = None
+        self._last_latest_data    = None
+        self._last_latest_context = None
+        self._data_lock = threading.Lock()
+        self._previous_active_window_on_mac = None
+
+        self.anki_shortcut_was_pressed = False
+        self.copy_shortcut_was_pressed = False
+        self._anki_presence_status = None   # None=unknown, True=in Anki, False=new
+        self._last_presence_word   = None   # reset on hide → always re-check on new show
+        self._last_mouse_pos       = None   # throttle move_to calls
+        self._last_html            = None   # skip redundant setText calls
+        self._last_size            = None   # skip redundant resize calls
+
+        self.shared_state = shared_state
+        self.input_loop   = input_loop
+
+        self.is_visible = False
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.process_latest_data_loop)
+        self.timer.start(60)
+
+        # Separate fast timer — only for cursor tracking and show/hide.
+        # Keeps popup movement at ~60fps independently of content logic.
+        self._move_timer = QTimer(self)
+        self._move_timer.timeout.connect(self._move_timer_tick)
+        self._move_timer.start(16)
+
+        # Off-screen probe label for height calculations (never shown)
+        self.probe_label = QLabel()
+        self.probe_label.setWordWrap(True)
+        self.probe_label.setTextFormat(Qt.TextFormat.RichText)
+
+        self.is_calibrated         = False
+        self.header_chars_per_line = 50
+        self.def_chars_per_line    = 50
+
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint |
+            Qt.WindowType.WindowStaysOnTopHint |
+            Qt.WindowType.Tool
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)  # never steal focus
+        self.setStyleSheet("background: transparent;")
+
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+
+        self.frame = QFrame()
+        self._apply_frame_stylesheet()
+        main_layout.addWidget(self.frame)
+
+        self.content_layout = QVBoxLayout(self.frame)
+        self.content_layout.setContentsMargins(10, 10, 10, 10)
+        self.content_layout.setSpacing(4)
+
+        # Main dictionary content
+        self.display_label = QLabel()
+        self.display_label.setWordWrap(True)
+        self.display_label.setTextFormat(Qt.TextFormat.RichText)
+        self.content_layout.addWidget(self.display_label)
+
+        # Brief status message (e.g. "Mined!" / "Already in Anki") — hidden by default
+        self.status_label = QLabel()
+        self.status_label.setWordWrap(False)
+        self.status_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.status_label.setStyleSheet("color: #f0c674; font-size: 11px;")
+        self.status_label.hide()
+        self.content_layout.addWidget(self.status_label)
+
+        # Mine bar — always shown when popup is visible
+        # Green ⊕ = new word (click to mine), Grey ✓ = already mined
+        self.mine_bar = QLabel()
+        self.mine_bar.setTextFormat(Qt.TextFormat.RichText)
+        self.mine_bar.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.mine_bar.setFixedHeight(MINE_BAR_HEIGHT)
+        self.mine_bar.linkActivated.connect(self._on_mine_clicked)
+        self.mine_bar.setStyleSheet("margin-top: 2px;")
+        self._set_mine_bar_new()          # default: green ⊕ Mine
+        self.content_layout.addWidget(self.mine_bar)
+
+        # Connect signals
+        self.anki_presence_updated.connect(self._on_anki_presence_updated)
+        self.status_message_signal.connect(self._show_status_message)
+
+        self.hide()
+
+    # ------------------------------------------------------------------ #
+    #  Mine bar helpers                                                     #
+    # ------------------------------------------------------------------ #
+
+    def _set_mine_bar_new(self):
+        """Green ⊕ — word not yet in Anki. Click to mine."""
+        fs = max(13, config.font_size_definitions)
+        self.mine_bar.setText(
+            f'<div style="text-align:center;width:100%;">'
+            f'<a href="mine" style="color:#4CAF50;text-decoration:none;font-size:{fs}px;"'
+            f' title="Click or press Alt+A to mine">⊕ Mine</a>'
+            f'</div>'
+        )
+
+    def _set_mine_bar_mined(self):
+        """Grey ✓ — word already in Anki."""
+        fs = max(13, config.font_size_definitions)
+        self.mine_bar.setText(
+            f'<div style="text-align:center;width:100%;">'
+            f'<span style="color:#888888;font-size:{fs}px;">✓ Already mined</span>'
+            f'</div>'
+        )
+
+    def _on_mine_clicked(self, _url):
+        self.add_to_anki()
+
+    def _on_anki_presence_updated(self, word: str, is_present: bool):
+        # Only update the bar if this result is still for the current word
+        # (race condition guard: async result may arrive after cursor moved)
+        if word == self._last_presence_word:
+            self._anki_presence_status = is_present
+            if is_present:
+                self._set_mine_bar_mined()
+            else:
+                self._set_mine_bar_new()
+
+    # ------------------------------------------------------------------ #
+    #  Frame stylesheet                                                     #
+    # ------------------------------------------------------------------ #
+
+    def _apply_frame_stylesheet(self):
+        bg_color = QColor(config.color_background)
+        r, g, b = bg_color.red(), bg_color.green(), bg_color.blue()
+        a = config.background_opacity
+        self.probe_label.setFont(QFont(config.font_family))
+        self.frame.setStyleSheet(f"""
+            QFrame {{
+                background-color: rgba({r}, {g}, {b}, {a});
+                color: {config.color_foreground};
+                border-radius: 8px;
+                border: 1px solid #555;
+            }}
+            QLabel {{
+                background-color: transparent;
+                border: none;
+                font-family: "{config.font_family}";
+            }}
+            hr {{
+                border: none;
+                height: 1px;
+            }}
+        """)
+
+    # ------------------------------------------------------------------ #
+    #  Font calibration                                                     #
+    # ------------------------------------------------------------------ #
+
+    def _calibrate_empirically(self):
+        logger.debug("--- Calibrating Font Metrics Empirically (One-Time) ---")
+        actual_font = self.display_label.font()
+        font_info   = QFontInfo(actual_font)
+        logger.debug(f"[FONT] Resolved font: '{font_info.family()}' {font_info.pointSize()}pt")
+
+        margins = self.content_layout.contentsMargins()
+        border_width = 1
+        horizontal_padding = margins.left() + margins.right() + (border_width * 2)
+
+        screen = QApplication.primaryScreen()
+        if screen is None:
+            logger.warning("No primary screen found; skipping calibration.")
+            return
+        self.max_content_width = (int(screen.geometry().width() * 0.4)) - horizontal_padding
+
+        header_font = QFont(config.font_family)
+        header_font.setPixelSize(config.font_size_header)
+        self.header_chars_per_line = self._find_chars_for_width(QFontMetrics(header_font))
+
+        def_font = QFont(config.font_family)
+        def_font.setPixelSize(config.font_size_definitions)
+        self.def_chars_per_line = self._find_chars_for_width(QFontMetrics(def_font))
+
+        logger.debug(f"[CALIBRATE] max_content_width={self.max_content_width}px  "
+                     f"header={self.header_chars_per_line}ch  def={self.def_chars_per_line}ch")
+        self.is_calibrated = True
+
+    def _find_chars_for_width(self, metrics: QFontMetrics) -> int:
+        low, high, best = 1, 500, 1
+        while low <= high:
+            mid = (low + high) // 2
+            if metrics.horizontalAdvance('x' * mid) <= self.max_content_width:
+                best = mid
+                low  = mid + 1
+            else:
+                high = mid - 1
+        return max(best, 1)
+
+    # ------------------------------------------------------------------ #
+    #  Data access                                                          #
+    # ------------------------------------------------------------------ #
+
+    def set_latest_data(self, data, context: Optional[Dict[str, Any]] = None):
+        if context is None:
+            context = {}
+        if "document_title" not in context:
+            try:
+                context["document_title"] = get_active_window_title()
+            except Exception:
+                context["document_title"] = ""
+        with self._data_lock:
+            self._latest_data   = data
+            self._latest_context = context
+
+    def get_latest_data(self) -> Tuple[Any, Optional[Dict[str, Any]]]:
+        with self._data_lock:
+            return self._latest_data, self._latest_context
+
+    # ------------------------------------------------------------------ #
+    #  Main logic loop (runs every 60 ms — content render, presence, shortcuts) #
+    # ------------------------------------------------------------------ #
+
+    def process_latest_data_loop(self):
+        if not self.is_calibrated:
+            self._calibrate_empirically()
+            if not self.is_calibrated:
+                return  # wait until calibration succeeds
+
+        latest_data, latest_context = self.get_latest_data()
+
+        # Re-render only when content actually changes
+        if latest_data and (latest_data    != self._last_latest_data or
+                            latest_context != self._last_latest_context):
+            full_html, new_size = self._calculate_content_and_size(latest_data)
+            if full_html is not None and new_size is not None:
+                if full_html != self._last_html:
+                    self.display_label.setText(full_html)
+                    self._last_html = full_html
+                if new_size != self._last_size:
+                    self.setFixedSize(new_size)
+                    self._last_size = new_size
+
+        self._last_latest_data    = latest_data
+        self._last_latest_context = latest_context
+
+        # Hotkey state — used for both presence check and shortcuts
+        _kp = getattr(self.input_loop, 'hotkey_is_pressed', False)
+        _as = config.auto_scan_mode and config.auto_scan_mode_lookups_without_hotkey
+        hotkey_down = latest_data and (_kp or _as)
+
+        # Presence check — only while popup is on screen
+        if self.is_visible and latest_data:
+            if not isinstance(latest_data[0], KanjiEntry):
+                word = (getattr(latest_data[0], "written_form", "") or
+                        getattr(latest_data[0], "reading", "") or "")
+                if word and word != self._last_presence_word:
+                    self._last_presence_word = word
+                    self._set_mine_bar_new()
+                    self._check_anki_presence_async(word)
+
+        # Shortcuts — check whenever hotkey is held, even if lock was busy
+        # (mining must work even if show_popup() couldn't acquire screen_lock)
+        if hotkey_down:
+            anki_key = getattr(config, "add_to_anki", "Alt+A")
+            anki_pressed = self.input_loop.is_key_pressed(anki_key)
+            if anki_pressed and not self.anki_shortcut_was_pressed:
+                self.add_to_anki()
+            self.anki_shortcut_was_pressed = anki_pressed
+
+            copy_key = getattr(config, "copy_text", "Alt+C")
+            copy_pressed = self.input_loop.is_key_pressed(copy_key)
+            if copy_pressed and not self.copy_shortcut_was_pressed:
+                self.copy_to_clipboard()
+            self.copy_shortcut_was_pressed = copy_pressed
+        else:
+            self.anki_shortcut_was_pressed = False
+            self.copy_shortcut_was_pressed = False
+
+    # ------------------------------------------------------------------ #
+    #  Popup actions                                                        #
+    # ------------------------------------------------------------------ #
+
+    def _move_timer_tick(self):
+        """Runs every 16 ms — handles show/hide and smooth cursor tracking.
+        Kept cheap: only reads hotkey state and moves the window."""
+        _kp = getattr(self.input_loop, 'hotkey_is_pressed', False)
+        _as = config.auto_scan_mode and config.auto_scan_mode_lookups_without_hotkey
+        has_data = self._latest_data is not None
+        should_show = has_data and (_kp or _as)
+
+        if should_show:
+            self.show_popup()
+            if self.is_visible:
+                mouse_pos = QCursor.pos()
+                mp = (mouse_pos.x(), mouse_pos.y())
+                lp = self._last_mouse_pos
+                if lp is None or abs(mp[0] - lp[0]) > 1 or abs(mp[1] - lp[1]) > 1:
+                    self._last_mouse_pos = mp
+                    self.move_to(mp[0], mp[1])
+        else:
+            self.hide_popup()
+
+    def copy_to_clipboard(self):
+        _, ctx = self.get_latest_data()
+        if ctx:
+            text = (ctx.get("context_text") or "").strip()
+            if text:
+                QApplication.clipboard().setText(text)
+
+    def add_to_anki(self):
+        entries, ctx = self.get_latest_data()
+        if not entries or not ctx:
+            return
+        entry = entries[0]
+        if isinstance(entry, KanjiEntry):
+            return
+        threading.Thread(
+            target=self._add_to_anki_thread,
+            args=(entry, ctx),
+            daemon=True
+        ).start()
+
+    def _add_to_anki_thread(self, entry: DictionaryEntry, ctx: Dict[str, Any]):
+        """Runs in a background thread. Only emits signals to touch the UI."""
+        anki = AnkiClient(getattr(config, "url", "http://127.0.0.1:8765"))
+        if not anki.ping():
+            logger.error("AnkiConnect not reachable")
+            self.status_message_signal.emit("Error: Anki not reachable")
+            return
+
+        word    = getattr(entry, "written_form", "") or ""
+        reading = getattr(entry, "reading",       "") or ""
+        sentence = (ctx.get("context_text") or "").strip()
+
+        meanings = []
+        for sense in (getattr(entry, "senses", []) or []):
+            glosses = sense.get("glosses", []) if isinstance(sense, dict) else []
+            if glosses:
+                meanings.append(glosses[0])
+        meaning_str = "<br>".join(meanings)
+
+        # Duplicate guard — same expression-field logic as presence check
+        if getattr(config, "prevent_duplicates", True):
+            deck_name   = getattr(config, "deck_name", "")
+            deck_filter = f'deck:"{deck_name}" ' if deck_name else ""
+            field_map   = getattr(config, "anki_field_map", {}) or {}
+            expr_field  = next(
+                (af for af, src in field_map.items()
+                 if src in ("{expression}", "Word", "Expression")), None)
+            dup_fields  = [expr_field] if expr_field else ["Front", "Word", "Expression"]
+            safe_re     = _re.escape(word or reading)
+            for field in dup_fields:
+                try:
+                    if anki.find_notes(f'{deck_filter}{field}:re:^{safe_re}$'):
+                        self.status_message_signal.emit("Already in Anki")
+                        _dup_word = word or reading
+                        self.anki_presence_updated.emit(_dup_word, True)
+                        return
+                except Exception:
+                    pass
+
+        # Build field map
+        full_glossary = "<br>".join(
+            ", ".join(s.get("glosses", [])) for s in (getattr(entry, "senses", []) or [])
+        )
+        first_dict_glossary = ""
+        for s in (getattr(entry, "senses", []) or []):
+            glosses = s.get("glosses", [])
+            if glosses:
+                first_dict_glossary = glosses[0]
+                break
+        furigana_plain = f"{word}[{reading}]" if (word and reading) else (word or reading)
+        freq_val = getattr(entry, "freq", 999999)
+        freq_str = "" if freq_val >= 999999 else str(freq_val)
+        tags_str = " ".join(sorted(getattr(entry, "tags", set()) or []))
+        conj_str = " > ".join(getattr(entry, "deconjugation_process", ()) or ())
+        # sentence split at cloze boundary (word position)
+        cloze_prefix = ""
+        cloze_suffix = ""
+        if sentence and word:
+            idx = sentence.find(word)
+            if idx >= 0:
+                cloze_prefix = sentence[:idx]
+                cloze_suffix = sentence[idx + len(word):]
+
+        data_sources = {
+            # Exact Yomitan marker names (from screenshots)
+            "{audio}":                    "",          # not supported; leave blank
+            "{cloze-prefix}":             cloze_prefix,
+            "{cloze-suffix}":             cloze_suffix,
+            "{document-title}":           ctx.get("document_title", ""),
+            "{expression}":               word,
+            "{frequencies}":              freq_str,
+            "{frequency-average-rank}":   freq_str,
+            "{frequency-harmonic-rank}":  freq_str,
+            "{furigana-plain}":           furigana_plain,
+            "{glossary}":                 full_glossary,
+            "{glossary-brief}":           meaning_str,
+            "{glossary-first}":           meaning_str,
+            "{glossary-1st-dict}":        first_dict_glossary,
+            "{picture}":                  "",          # not supported; leave blank
+            "{pitch-accent-graphs}":      "",          # not supported; leave blank
+            "{pitch-accent-positions}":   "",          # not supported; leave blank
+            "{reading}":                  reading,
+            "{sentence}":                 sentence,
+            "{tags}":                     tags_str,
+        }
+
+        user_map = getattr(config, "anki_field_map", {}) or {}
+        if user_map:
+            fields = {k: data_sources.get(v, str(v)) for k, v in user_map.items() if v}
+        else:
+            fields = {"Front": word or reading, "Back": meaning_str}
+
+        tags = []
+        if getattr(config, "add_meikipop_tag", True):
+            tags.append("weikipop")
+        if getattr(config, "add_document_title_tag", True):
+            title = (ctx.get("document_title") or "").strip()
+            if title:
+                tags.append(title.replace(" ", "_"))
+
+        note = {
+            "deckName":  getattr(config, "deck_name",  "Default"),
+            "modelName": getattr(config, "model_name", "Basic"),
+            "fields":    fields,
+            "tags":      tags,
+        }
+
+        if getattr(config, "enable_screenshot", False) and ctx.get("screenshot"):
+            try:
+                from PIL import Image
+                screenshot = ctx["screenshot"]
+                img  = Image.frombytes("RGB", screenshot.size, screenshot.bgra, "raw", "BGRX")
+                fname = f"weikipop_{int(time.time())}.png"
+                bio   = BytesIO()
+                img.save(bio, format="PNG")
+                b64 = base64.b64encode(bio.getvalue()).decode("ascii")
+                anki.store_media_file(fname, b64)
+                img_tag = f'<img src="{fname}">'
+
+                # Insert into whichever field the user mapped to {picture},
+                # OR any field whose name suggests it holds images.
+                field_map = getattr(config, "anki_field_map", {}) or {}
+                pic_anki_field = next(
+                    (af for af, src in field_map.items() if src == "{picture}"), None
+                )
+                if pic_anki_field and pic_anki_field in note["fields"]:
+                    note["fields"][pic_anki_field] = img_tag
+                else:
+                    # Fallback: common image field names
+                    for pic_field in ("Picture", "Image", "Screenshot", "image", "picture", "screenshot"):
+                        if pic_field in note["fields"]:
+                            note["fields"][pic_field] = img_tag
+                            break
+                    else:
+                        # Last resort: add as extra field so it's not lost
+                        note["fields"]["Picture"] = img_tag
+            except Exception as e:
+                logger.error(f"Screenshot failed: {e}")
+
+        try:
+            note_id = anki.add_note(note)
+            logger.info(f"Added note {note_id} to Anki")
+            self.status_message_signal.emit(f"Mined: {word or reading}")
+            _mined_word = word or reading
+            self.anki_presence_updated.emit(_mined_word, True)
+        except Exception as e:
+            logger.error(f"Failed to add note: {e}")
+            self.status_message_signal.emit(f"Error: {e}")
+
+    # ------------------------------------------------------------------ #
+    #  Anki presence check (background thread)                             #
+    # ------------------------------------------------------------------ #
+
+    def _check_anki_presence_async(self, word: str):
+        if not getattr(config, "show_hover_status", True):
+            return
+
+        def _run():
+            try:
+                anki = AnkiClient(getattr(config, "url", "http://127.0.0.1:8765"))
+                if not anki.ping():
+                    return  # Anki not running
+                if not word:
+                    return
+
+                deck_name   = getattr(config, "deck_name", "")
+                deck_filter = f'deck:"{deck_name}" ' if deck_name else ""
+
+                # Find which Anki field the user mapped to {expression}.
+                # If no mapping exists, fall back to common field names.
+                field_map = getattr(config, "anki_field_map", {}) or {}
+                expression_field = next(
+                    (anki_f for anki_f, src in field_map.items()
+                     if src in ("{expression}", "Word", "Expression")),
+                    None
+                )
+                search_fields = [expression_field] if expression_field else [
+                    "Front", "Word", "Expression", "Vocab", "Kanji"
+                ]
+
+                # re:^...$  = exact field match, not substring
+                safe  = _re.escape(word)
+                found = False
+                for field in search_fields:
+                    try:
+                        if anki.find_notes(f'{deck_filter}{field}:re:^{safe}$'):
+                            found = True
+                            break
+                    except Exception:
+                        pass
+                self.anki_presence_updated.emit(word, found)
+            except Exception:
+                pass
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    # ------------------------------------------------------------------ #
+    #  Status message (called on main thread via signal)                   #
+    # ------------------------------------------------------------------ #
+
+    def _show_status_message(self, message: str, duration_ms: int = 2500):
+        self.status_label.setText(message)
+        self.status_label.show()
+        if duration_ms > 0:
+            QTimer.singleShot(duration_ms, self.status_label.hide)
+
+    # ------------------------------------------------------------------ #
+    #  Content rendering                                                    #
+    # ------------------------------------------------------------------ #
+
+    def _calculate_content_and_size(self, entries) -> tuple:
+        if not self.is_calibrated or not entries:
+            return None, None
+
+        all_html_parts = []
+        max_ratio = 0.0
+
+        for i, entry in enumerate(entries):
+            if i > 0:
+                all_html_parts.append('<hr style="margin-top:0;margin-bottom:0;">')
+
+            if isinstance(entry, KanjiEntry):
+                defn = ', '.join(entry.meanings) if (config.show_examples or config.show_components) else '[字]'
+                calc = f"{entry.character} {', '.join(entry.readings)} {defn}"
+                max_ratio = max(max_ratio, len(calc) / self.header_chars_per_line, 0.7)
+                all_html_parts.append(self._render_kanji_entry(entry))
+                continue
+
+            # Header
+            header_calc = entry.written_form or ""
+            if entry.reading:
+                header_calc += f" [{entry.reading}]"
+            max_ratio = max(max_ratio, len(header_calc) / self.header_chars_per_line)
+
+            header_html = (
+                f'<span style="color:{config.color_highlight_word};'
+                f'font-size:{config.font_size_header}px;">{entry.written_form}</span>'
+            )
+            if entry.reading:
+                header_html += (
+                    f' <span style="color:{config.color_highlight_reading};'
+                    f'font-size:{config.font_size_header - 2}px;">[{entry.reading}]</span>'
+                )
+            if entry.deconjugation_process and config.show_deconjugation:
+                dc = " ← ".join(p for p in entry.deconjugation_process if p)
+                if dc:
+                    header_html += (
+                        f' <span style="color:{config.color_foreground};'
+                        f'font-size:{config.font_size_definitions - 2}px;opacity:0.8;">({dc})</span>'
+                    )
+            if config.show_frequency and entry.freq < 999_999:
+                header_html += (
+                    f' <span style="color:{config.color_foreground};'
+                    f'font-size:{config.font_size_definitions - 2}px;opacity:0.6;">#{entry.freq}</span>'
+                )
+
+            # Definitions
+            parts_calc, parts_html = [], []
+            for idx, sense in enumerate(entry.senses):
+                glosses   = sense.get("glosses", [])
+                pos_list  = sense.get("pos",     [])
+                tags_list = sense.get("tags",    [])
+
+                gloss_str = (", ".join(glosses) if config.show_all_glosses else (glosses[0] if glosses else ""))
+                s_calc = f"({idx+1})" if config.show_all_glosses else ""
+                s_html = f"<b>({idx+1})</b> " if config.show_all_glosses else ""
+
+                if config.show_pos and pos_list:
+                    pos_str = f' ({", ".join(pos_list)})'
+                    s_calc += pos_str
+                    s_html += f'<span style="color:{config.color_foreground};opacity:0.7;"><i>{pos_str}</i></span> '
+                if config.show_tags and tags_list:
+                    t_str = f' [{", ".join(tags_list)}]'
+                    s_calc += t_str
+                    s_html += (f'<span style="color:{config.color_foreground};'
+                               f'font-size:{config.font_size_definitions-2}px;opacity:0.7;">{t_str}</span> ')
+                s_calc += gloss_str
+                s_html += gloss_str
+                parts_calc.append(s_calc)
+                parts_html.append(s_html)
+
+            if config.compact_mode:
+                sep = "; "
+                full_def_html = sep.join(parts_html)
+                max_ratio = max(max_ratio, len(sep.join(parts_calc)) / self.def_chars_per_line)
+            else:
+                sep = "<br>"
+                full_def_html = sep.join(parts_html)
+                for p in parts_calc:
+                    max_ratio = max(max_ratio, len(p) / self.def_chars_per_line)
+
+            sep_space = " " if config.compact_mode else "<br>"
+            defs_html = (f'{sep_space}<span style="font-size:{config.font_size_definitions}px;">'
+                         f'{full_def_html}</span>')
+            all_html_parts.append(f"{header_html}{defs_html}")
+
+        # Compute size
+        optimal_w = max(self.max_content_width * min(1.0, max_ratio), 200)
+        full_html  = "".join(all_html_parts)
+        self.probe_label.setText(full_html)
+        content_h = self.probe_label.heightForWidth(int(optimal_w))
+
+        margins  = self.content_layout.contentsMargins()
+        spacing  = self.content_layout.spacing()
+        border   = 1
+        h_pad = margins.left() + margins.right() + border * 2
+        v_pad = margins.top() + margins.bottom() + border * 2 + MINE_BAR_HEIGHT + spacing
+
+        size = QSize(int(optimal_w) + h_pad, content_h + v_pad)
+        return full_html, size
+
+    def _render_kanji_entry(self, entry: KanjiEntry) -> str:
+        c_word = config.color_highlight_word
+        c_read = config.color_highlight_reading
+        c_text = config.color_foreground
+        fs_h   = config.font_size_header
+        fs_d   = config.font_size_definitions
+
+        readings_str = f"[{', '.join(entry.readings)}]"
+        header_html  = (
+            f'<span style="font-size:{fs_h}px;color:{c_word};padding-right:8px;">{entry.character}</span>'
+            f'<span style="font-size:{fs_h-2}px;color:{c_read};"> {readings_str}</span>'
+        )
+        meanings_html = f'<span style="font-size:{fs_d}px;color:{c_text};">{", ".join(entry.meanings)}</span>'
+        if not config.compact_mode:
+            meanings_html = (f'<span style="font-size:{fs_d}px;color:{c_text};"> [字]</span>'
+                             f'<div>{meanings_html}</div>')
+
+        examples_html = ""
+        if config.show_examples:
+            parts = [
+                (f"<span style='font-size:{fs_h-2}px;color:{c_word}'>{e['w']}</span> "
+                 f"<span style='font-size:{fs_d}px;color:{c_read}'>[{e['r']}]</span> "
+                 f"<span style='font-size:{fs_d}px;color:{c_text}'>{e['m']}</span>")
+                for e in entry.examples
+            ]
+            if parts:
+                examples_html = f'<div>{"; ".join(parts)}</div>'
+
+        components_html = ""
+        if config.show_components:
+            parts = [
+                (f"<span style='font-size:{fs_d}px;color:{c_word}'>{c.get('c','')}</span> "
+                 f"<span style='font-size:{fs_d}px;color:{c_text}'>{c.get('m','')}</span>")
+                for c in entry.components
+            ]
+            if parts:
+                components_html = f'<div>{", ".join(parts)}</div>'
+
+        return (f'<div style="border:1px solid {c_word};">'
+                f'{header_html}{meanings_html}{examples_html}{components_html}</div>')
+
+    # ------------------------------------------------------------------ #
+    #  Popup visibility & positioning                                       #
+    # ------------------------------------------------------------------ #
+
+    def show_popup(self):
+        if self.is_visible:
+            return
+        # Non-blocking: if screenshot is in progress, skip this tick
+        # rather than freezing the main thread waiting for the lock.
+        if not self.shared_state.screen_lock.acquire(blocking=False):
+            return
+        self._store_active_window_on_mac()
+        self.show()
+        if IS_MACOS:
+            self.raise_()
+        self.is_visible = True
+
+    def hide_popup(self):
+        if not self.is_visible:
+            return
+        self.hide()
+        self.is_visible = False
+        self._last_presence_word = None  # re-check on next show, even same word
+        QTimer.singleShot(50, self._release_lock_safely)
+        self._restore_focus_on_mac()
+
+    def _release_lock_safely(self):
+        logger.debug("releasing screen_lock")
+        self.shared_state.screen_lock.release()
+
+    def move_to(self, x: int, y: int):
+        cursor_point = QPoint(x, y)
+        screen = QApplication.screenAt(cursor_point) or QApplication.primaryScreen()
+        if screen is None:
+            return
+        screen_geo  = screen.geometry()
+        popup_size  = self.size()
+        offset      = 15
+
+        ratio = screen.devicePixelRatio()
+        x, y  = magpie_manager.transform_raw_to_visual((int(x), int(y)), ratio)
+
+        mode = config.popup_position_mode
+
+        if mode == "visual_novel_mode":
+            sh = screen_geo.height()
+            cy = y - screen_geo.top()
+            if cy > 2 * sh / 3:
+                is_below = False
+            elif cy < sh / 3:
+                is_below = True
+            else:
+                is_below = cy < sh / 2
+            final_y = (y + offset) if is_below else (y - popup_size.height() - offset)
+            final_y = max(screen_geo.top(), min(final_y, screen_geo.bottom() - popup_size.height()))
+
+            sw = screen_geo.width()
+            cx = x - screen_geo.left()
+            pr = x + offset
+            pc = x - popup_size.width() / 2
+            pl = x - popup_size.width() - offset
+            if cx < sw / 2:
+                t = cx / (sw / 2)
+                final_x = pr * (1 - t) + pc * t
+            else:
+                t = (cx - sw / 2) / (sw / 2)
+                final_x = pc * (1 - t) + pl * t
+
+        elif mode == "flip_horizontally":
+            pref_x  = x + offset
+            final_x = pref_x if pref_x + popup_size.width() <= screen_geo.right() else x - popup_size.width() - offset
+            final_y = y + offset
+            final_y = max(screen_geo.top(), min(final_y, screen_geo.bottom() - popup_size.height()))
+
+        elif mode == "flip_vertically":
+            final_x = x + offset
+            final_x = max(screen_geo.left(), min(final_x, screen_geo.right() - popup_size.width()))
+            pref_y  = y + offset
+            final_y = pref_y if pref_y + popup_size.height() <= screen_geo.bottom() else y - popup_size.height() - offset
+
+        else:  # flip_both
+            pref_x  = x + offset
+            final_x = pref_x if pref_x + popup_size.width() <= screen_geo.right() else x - popup_size.width() - offset
+            pref_y  = y + offset
+            final_y = pref_y if pref_y + popup_size.height() <= screen_geo.bottom() else y - popup_size.height() - offset
+
+        final_x = max(screen_geo.left(), min(final_x, screen_geo.right()  - popup_size.width()))
+        final_y = max(screen_geo.top(),  min(final_y, screen_geo.bottom() - popup_size.height()))
+        self.move(int(final_x), int(final_y))
+
+    def reapply_settings(self):
+        logger.debug("Popup: reapplying settings")
+        self._apply_frame_stylesheet()
+        self.is_calibrated = False
+
+    # ------------------------------------------------------------------ #
+    #  macOS focus management                                               #
+    # ------------------------------------------------------------------ #
+
+    def _store_active_window_on_mac(self):
+        if not IS_MACOS or not Quartz:
+            return
+        try:
+            app = Quartz.NSWorkspace.sharedWorkspace().frontmostApplication()
+            if app:
+                self._previous_active_window_on_mac = app
+        except Exception as e:
+            logger.warning(f"store_active_window failed: {e}")
+            self._previous_active_window_on_mac = None
+
+    def _restore_focus_on_mac(self):
+        if not IS_MACOS or not Quartz or not self._previous_active_window_on_mac:
+            return
+        try:
+            self._previous_active_window_on_mac.activateWithOptions_(
+                Quartz.NSApplicationActivateAllWindows
+            )
+        except Exception as e:
+            logger.warning(f"restore_focus failed: {e}")
+        finally:
+            self._previous_active_window_on_mac = None

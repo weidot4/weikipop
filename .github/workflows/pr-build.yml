@@ -1,0 +1,37 @@
+# .github/workflows/pr-build.yml
+name: pre-release builds
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: set up python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: compile check
+        run: python -m compileall src scripts
+
+  build-windows:
+    needs: quality
+    uses: ./.github/workflows/build-windows.yml
+
+  build-linux:
+    needs: quality
+    uses: ./.github/workflows/build-linux.yml
