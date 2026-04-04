@@ -4,7 +4,7 @@ weikipop is a desktop Japanese OCR lookup tool built on top of the original Meik
 
 It continuously or manually scans a screen region, performs OCR, and shows dictionary lookups in a popup. It also supports adding cards to Anki via AnkiConnect.
 
-<img width="1695" height="941" alt="image" src="https://github.com/user-attachments/assets/6829e700-2fbd-47ba-94ac-bebdc767ce7d" />
+<img width="1695" height="941" alt="image" src="https://github.com/user-attachments/assets/a6105d75-5556-4ea0-8eae-0a394fa52e3c" />
 
 ## Features
 
